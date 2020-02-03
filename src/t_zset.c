@@ -84,7 +84,9 @@ zskiplist *zslCreate(void) {
     zsl = zmalloc(sizeof(*zsl));
     zsl->level = 1;
     zsl->length = 0;
+    // 头结点不记录 ele 和 score，创建了 ZSKIPLIST_MAXLEVEL 层
     zsl->header = zslCreateNode(ZSKIPLIST_MAXLEVEL,0,NULL);
+    // 初始化头结点 level
     for (j = 0; j < ZSKIPLIST_MAXLEVEL; j++) {
         zsl->header->level[j].forward = NULL;
         zsl->header->level[j].span = 0;
@@ -119,10 +121,13 @@ void zslFree(zskiplist *zsl) {
  * The return value of this function is between 1 and ZSKIPLIST_MAXLEVEL
  * (both inclusive), with a powerlaw-alike distribution where higher
  * levels are less likely to be returned. */
+// 层数越高，概率越小。
 int zslRandomLevel(void) {
     int level = 1;
+    // 每增加一层概率是 ZSKIPLIST_P，所以层数越高，概率越小。
     while ((random()&0xFFFF) < (ZSKIPLIST_P * 0xFFFF))
         level += 1;
+    // 最高层数 ZSKIPLIST_MAXLEVEL
     return (level<ZSKIPLIST_MAXLEVEL) ? level : ZSKIPLIST_MAXLEVEL;
 }
 
@@ -130,13 +135,18 @@ int zslRandomLevel(void) {
  * exist (up to the caller to enforce that). The skiplist takes ownership
  * of the passed SDS string 'ele'. */
 zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
+    // update 保存每层遍历到满足条件的最后一个结点。
     zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+
+    // rank 排名保存 span 结点间距。
     unsigned int rank[ZSKIPLIST_MAXLEVEL];
     int i, level;
 
+    // 二维空间，level自上而下遍历，结点从头到尾遍历，找到合适的插入结点位置。
     serverAssert(!isnan(score));
     x = zsl->header;
     for (i = zsl->level-1; i >= 0; i--) {
+        // 下层保存上层的步距。
         /* store rank that is crossed to reach the insert position */
         rank[i] = i == (zsl->level-1) ? 0 : rank[i+1];
         while (x->level[i].forward &&
@@ -144,31 +154,49 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
                     (x->level[i].forward->score == score &&
                     sdscmp(x->level[i].forward->ele,ele) < 0)))
         {
+            // 结点距离数目。
             rank[i] += x->level[i].span;
+            // 遍历下一个结点。
             x = x->level[i].forward;
         }
+
+        // 保存 i 层满足条件的最后一个结点。
         update[i] = x;
     }
+    
     /* we assume the element is not already inside, since we allow duplicated
      * scores, reinserting the same element should never happen since the
      * caller of zslInsert() should test in the hash table if the element is
      * already inside or not. */
+    // 随机层数
     level = zslRandomLevel();
     if (level > zsl->level) {
+        // 初始化新增加的层，指向头结点，步距是列表的长度（结点个数）。
         for (i = zsl->level; i < level; i++) {
             rank[i] = 0;
             update[i] = zsl->header;
+            // 新增的 level 上是有指向结点指针的。
             update[i]->level[i].span = zsl->length;
         }
         zsl->level = level;
     }
+
+    // 创建新的结点保存数据。
     x = zslCreateNode(level,score,ele);
+
+    // 插入结点到列表
     for (i = 0; i < level; i++) {
+        // level 自下而上与同层的插入位置前后结点建立联系。
         x->level[i].forward = update[i]->level[i].forward;
         update[i]->level[i].forward = x;
 
         /* update span covered by update[i] as x is inserted here */
+        // span：在同一个层级，当前结点到下一个结点的距离。
+        // rank[0] - rank[i] 是插入位置，到 i 层所在结点的，结点距离。
+        // update[i]->level[i].span 是插入位置到下一个结点到距离。
         x->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]);
+
+        // 在 update[i] 后面添加了一个结点，span + 1
         update[i]->level[i].span = (rank[0] - rank[i]) + 1;
     }
 
@@ -177,6 +205,7 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
         update[i]->level[i].span++;
     }
 
+    // 处理双向结点的前后结点连接关系。
     x->backward = (update[0] == zsl->header) ? NULL : update[0];
     if (x->level[0].forward)
         x->level[0].forward->backward = x;
@@ -189,6 +218,7 @@ zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
 /* Internal function used by zslDelete, zslDeleteByScore and zslDeleteByRank */
 void zslDeleteNode(zskiplist *zsl, zskiplistNode *x, zskiplistNode **update) {
     int i;
+    // 处理删除结点后结点间的距离。
     for (i = 0; i < zsl->level; i++) {
         if (update[i]->level[i].forward == x) {
             update[i]->level[i].span += x->level[i].span - 1;
@@ -202,6 +232,8 @@ void zslDeleteNode(zskiplist *zsl, zskiplistNode *x, zskiplistNode **update) {
     } else {
         zsl->tail = x->backward;
     }
+
+    // 不允许一层上面没有指针指向数据结点。
     while(zsl->level > 1 && zsl->header->level[zsl->level-1].forward == NULL)
         zsl->level--;
     zsl->length--;
@@ -479,12 +511,18 @@ unsigned long zslGetRank(zskiplist *zsl, double score, sds ele) {
     int i;
 
     x = zsl->header;
+
+    // 垂直方向 level 向下遍历。
     for (i = zsl->level-1; i >= 0; i--) {
+        // 从顶层向前遍历比 score 小的结点。满足条件的最后一个结点，再从该结点的下一个 level 去遍历
         while (x->level[i].forward &&
             (x->level[i].forward->score < score ||
                 (x->level[i].forward->score == score &&
                 sdscmp(x->level[i].forward->ele,ele) <= 0))) {
+
+            // 同级 level 向前累加 span
             rank += x->level[i].span;
+            // x 向前移动
             x = x->level[i].forward;
         }
 
@@ -726,6 +764,7 @@ double zzlGetScore(unsigned char *sptr) {
     char buf[128];
     double score;
 
+    // vstr 有可能是字符串，例如："34328742.423423"，vlong 是整型。
     serverAssert(sptr != NULL);
     serverAssert(ziplistGet(sptr,&vstr,&vlen,&vlong));
 
@@ -996,13 +1035,17 @@ unsigned char *zzlLastInLexRange(unsigned char *zl, zlexrangespec *range) {
     return NULL;
 }
 
+// 遍历 ziplist 结点，查找 ele
 unsigned char *zzlFind(unsigned char *zl, sds ele, double *score) {
+    // 指向第一个结点指针。
     unsigned char *eptr = ziplistIndex(zl,0), *sptr;
 
     while (eptr != NULL) {
+        // sptr 指向下一个结点指针，eptr 指向当前结点指针。
         sptr = ziplistNext(zl,eptr);
         serverAssert(sptr != NULL);
 
+        // 开始存储 ele，接着存储 score
         if (ziplistCompare(eptr,(unsigned char*)ele,sdslen(ele))) {
             /* Matching element, pull out score. */
             if (score != NULL) *score = zzlGetScore(sptr);
@@ -1015,6 +1058,7 @@ unsigned char *zzlFind(unsigned char *zl, sds ele, double *score) {
     return NULL;
 }
 
+// 删除数据，score 和 value 同时删除
 /* Delete (element,score) pair from ziplist. Use local copy of eptr because we
  * don't want to modify the one given as argument. */
 unsigned char *zzlDelete(unsigned char *zl, unsigned char *eptr) {
@@ -1026,6 +1070,7 @@ unsigned char *zzlDelete(unsigned char *zl, unsigned char *eptr) {
     return zl;
 }
 
+// ele, score 顺序插入到 ziplist
 unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, double score) {
     unsigned char *sptr;
     char scorebuf[128];
@@ -1037,11 +1082,14 @@ unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, doub
         zl = ziplistPush(zl,(unsigned char*)ele,sdslen(ele),ZIPLIST_TAIL);
         zl = ziplistPush(zl,(unsigned char*)scorebuf,scorelen,ZIPLIST_TAIL);
     } else {
+
+        // 标记插入位置的 offset，因为插入结点后，列表内存有可能被重新分配。
         /* Keep offset relative to zl, as it might be re-allocated. */
         offset = eptr-zl;
         zl = ziplistInsert(zl,eptr,(unsigned char*)ele,sdslen(ele));
         eptr = zl+offset;
 
+        // 返回指向下一个结点指针位置，插入 score
         /* Insert score after the element. */
         serverAssert((sptr = ziplistNext(zl,eptr)) != NULL);
         zl = ziplistInsert(zl,sptr,(unsigned char*)scorebuf,scorelen);
@@ -1199,8 +1247,11 @@ void zsetConvert(robj *zobj, int encoding) {
             else
                 ele = sdsnewlen((char*)vstr,vlen);
 
+            // sorted set 是由 dict + skiplist 结合而成
             node = zslInsert(zs->zsl,score,ele);
             serverAssert(dictAdd(zs->dict,ele,&node->score) == DICT_OK);
+
+            // 获取一个 pair 的指针：<eptr, sptr>，<ele 指针，score 指针>
             zzlNext(zl,&eptr,&sptr);
         }
 
@@ -1283,7 +1334,6 @@ int zsetScore(robj *zobj, sds member, double *score) {
  * ZADD_NX:   Perform the operation only if the element does not exist.
  * ZADD_XX:   Perform the operation only if the element already exist.
  *
- * When ZADD_INCR is used, the new score of the element is stored in
  * '*newscore' if 'newscore' is not NULL.
  *
  * The returned flags are the following:
@@ -1319,6 +1369,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
     *flags = 0; /* We'll return our response flags. */
     double curscore;
 
+    // 检查 score 是否是数字。
     /* NaN as input is an error regardless of all the other parameters. */
     if (isnan(score)) {
         *flags = ZADD_NAN;
@@ -1329,6 +1380,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
     if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *eptr;
 
+        // 取 ele 和 score，ele, score 作为两个结点连续保存在 ziplist。
         if ((eptr = zzlFind(zobj->ptr,ele,&curscore)) != NULL) {
             /* NX? Return, same element already exists. */
             if (nx) {
@@ -1346,6 +1398,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
                 if (newscore) *newscore = score;
             }
 
+            // 更新结点，先删除 ele 和 score
             /* Remove and re-insert when score changed. */
             if (score != curscore) {
                 zobj->ptr = zzlDelete(zobj->ptr,eptr);
@@ -1353,7 +1406,8 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
                 *flags |= ZADD_UPDATED;
             }
             return 1;
-        } else if (!xx) {
+        } else if (!xx) { // xx 如果数据存在就更新。
+            // 找不到数据就插入，检查 ziplist 是否超过了数据限制
             /* Optimize: check if the element is too large or the list
              * becomes too long *before* executing zzlInsert. */
             zobj->ptr = zzlInsert(zobj->ptr,ele,score);
@@ -1545,16 +1599,23 @@ void zaddGenericCommand(client *c, int flags) {
     int processed = 0;  /* Number of elements processed, may remain zero with
                            options like XX. */
 
+    // 分析统计参数
+    // ZADD key [NX|XX] [CH] [INCR] score member [score member ...]
     /* Parse options. At the end 'scoreidx' is set to the argument position
      * of the score of the first score-element pair. */
     scoreidx = 2;
     while(scoreidx < c->argc) {
         char *opt = c->argv[scoreidx]->ptr;
-        if (!strcasecmp(opt,"nx")) flags |= ZADD_NX;
-        else if (!strcasecmp(opt,"xx")) flags |= ZADD_XX;
-        else if (!strcasecmp(opt,"ch")) flags |= ZADD_CH;
-        else if (!strcasecmp(opt,"incr")) flags |= ZADD_INCR;
-        else break;
+        if (!strcasecmp(opt,"nx")) 
+            flags |= ZADD_NX;
+        else if (!strcasecmp(opt,"xx")) 
+            flags |= ZADD_XX;
+        else if (!strcasecmp(opt,"ch")) 
+            flags |= ZADD_CH;
+        else if (!strcasecmp(opt,"incr")) 
+            flags |= ZADD_INCR;
+        else
+            break;
         scoreidx++;
     }
 
@@ -1586,6 +1647,7 @@ void zaddGenericCommand(client *c, int flags) {
         return;
     }
 
+    // 检查 score 是否有效
     /* Start parsing all the scores, we need to emit any syntax error
      * before executing additions to the sorted set, as the command should
      * either execute fully or nothing at all. */
@@ -1599,9 +1661,11 @@ void zaddGenericCommand(client *c, int flags) {
     zobj = lookupKeyWrite(c->db,key);
     if (zobj == NULL) {
         if (xx) goto reply_to_client; /* No key + XX option: nothing to do. */
+        // redis.conf
+        // zset-max-ziplist-entries 128
+        // zset-max-ziplist-value 64
         if (server.zset_max_ziplist_entries == 0 ||
-            server.zset_max_ziplist_value < sdslen(c->argv[scoreidx+1]->ptr))
-        {
+            server.zset_max_ziplist_value < sdslen(c->argv[scoreidx+1]->ptr)) {
             zobj = createZsetObject();
         } else {
             zobj = createZsetZiplistObject();
@@ -3302,4 +3366,22 @@ void bzpopminCommand(client *c) {
 // BZPOPMAX key [key ...] timeout
 void bzpopmaxCommand(client *c) {
     blockingGenericZpopCommand(c,ZSET_MAX);
+}
+
+void zsetTest() {
+    sds ele;
+    double score;
+    zskiplist *zsl;
+    zskiplistNode * node;
+
+    score = 1;
+    ele = sdsfromlonglong(11);
+
+    zsl = zslCreate();
+    node = zslInsert(zsl, score, ele);
+
+    score = 2;
+    ele = sdsfromlonglong(22);
+    node = zslInsert(zsl, score, ele);
+    zslFree(zsl);
 }
